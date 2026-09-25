@@ -4,7 +4,9 @@
 #include <WiFiClient.h>
 #include <esp_wifi.h>
 #include <esp_random.h>
+#include <esp_netif.h>
 #include <ping/ping_sock.h>
+#include <lwip/opt.h>
 #include <DNSServer.h>
 #include <vector>
 
@@ -63,6 +65,7 @@ const bool DEFAULT_USE_POWER_LED_PIN = false;
 const int DEFAULT_POWER_LED_PIN = 2;
 const char *const DEFAULT_ADMIN_PASSWORD_HASH = "";
 const bool DEFAULT_AUTO_RECONNECT_ENABLED = true;
+const bool DEFAULT_USE_IPV6 = true;
 
 String wifiSsid = "";
 String wifiPassword = "";
@@ -73,15 +76,25 @@ bool usePowerLedPin = DEFAULT_USE_POWER_LED_PIN;
 int powerLedPin = DEFAULT_POWER_LED_PIN;
 String adminPasswordHash = DEFAULT_ADMIN_PASSWORD_HASH;
 bool autoReconnectEnabled = DEFAULT_AUTO_RECONNECT_ENABLED;
+bool useIpv6Enabled = DEFAULT_USE_IPV6;
+unsigned long lastIpv6RetryAt = 0;
 // Set on successful /login; gates access to the config page ('/') whenever adminPasswordHash is set.
 String sessionToken = "";
+volatile bool ipv6LinkLocalAssigned = false;
+volatile bool ipv6GlobalAssigned = false;
 
 void handleWifiGotIPv6(arduino_event_id_t event, arduino_event_info_t info) {
-  if (event != ARDUINO_EVENT_WIFI_STA_GOT_IP6) return;
+  if (event != ARDUINO_EVENT_WIFI_STA_GOT_IP6 || !useIpv6Enabled) return;
 
   IPv6Address address(info.got_ip6.ip6_info.ip.addr);
-  Serial.print("[STA] IPv6 address assigned: ");
-  Serial.println(address);
+  String addressText = address.toString();
+  addressText.toLowerCase();
+  const bool isLinkLocal = addressText.startsWith("fe80:");
+  ipv6LinkLocalAssigned |= isLinkLocal;
+  ipv6GlobalAssigned |= !isLinkLocal;
+  Serial.printf("[STA] IPv6 %s address assigned: %s\n",
+                isLinkLocal ? "link-local" : "global",
+                addressText.c_str());
 }
 
 String escapeHtml(const String &input) {
@@ -192,11 +205,12 @@ void clearSavedConfig() {
   powerLedPin = DEFAULT_POWER_LED_PIN;
   adminPasswordHash = DEFAULT_ADMIN_PASSWORD_HASH;
   autoReconnectEnabled = DEFAULT_AUTO_RECONNECT_ENABLED;
+  useIpv6Enabled = DEFAULT_USE_IPV6;
   sessionToken = "";
 
   preferences.begin(CONFIG_NAMESPACE, false);
   preferences.clear();
-  preferences.putBool("factory_reset_pending", true);
+  preferences.putBool("fac_rs_pd", true);
   preferences.end();
 
   Serial.println("[CFG] All saved settings cleared and reset flag set.");
@@ -238,6 +252,7 @@ void loadConfig() {
   powerLedPin = preferences.getInt("pwrled_pin", DEFAULT_POWER_LED_PIN);
   adminPasswordHash = preferences.getString("admin_pwd_hash", DEFAULT_ADMIN_PASSWORD_HASH);
   autoReconnectEnabled = preferences.getBool("auto_reconnect", DEFAULT_AUTO_RECONNECT_ENABLED);
+  useIpv6Enabled = preferences.getBool("use_ipv6", DEFAULT_USE_IPV6);
   preferences.end();
 }
 
@@ -251,7 +266,8 @@ void saveConfig() {
   preferences.putInt("pwrled_pin", powerLedPin);
   preferences.putString("admin_pwd_hash", adminPasswordHash);
   preferences.putBool("auto_reconnect", autoReconnectEnabled);
-  preferences.putBool("factory_reset_pending", false);
+  preferences.putBool("use_ipv6", useIpv6Enabled);
+  preferences.putBool("fac_rs_pd", false);
   preferences.end();
   Serial.printf("[CFG] Saved: SSID=%s target=%s port=%u\n", wifiSsid.c_str(), targetIp.c_str(), configPort);
 }
@@ -412,6 +428,40 @@ String buildStatusJson() {
   return json;
 }
 
+String buildNetworkInfoJson() {
+  const wifi_mode_t mode = WiFi.getMode();
+  const bool staActive = mode == WIFI_STA || mode == WIFI_AP_STA;
+  const bool apActive = mode == WIFI_AP || mode == WIFI_AP_STA;
+  const char *modeName = mode == WIFI_STA ? "station"
+                       : mode == WIFI_AP ? "access-point"
+                       : mode == WIFI_AP_STA ? "station + access-point"
+                       : "off";
+
+  String json = "{\"mode\":\"" + String(modeName) + "\",";
+  json += "\"wifi_connected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
+  json += "\"http_port\":" + String(configPort) + ",";
+  json += "\"https_port\":" + String(httpsPort) + ",";
+  json += "\"sta_ipv4\":\"" + String(staActive ? WiFi.localIP().toString() : "") + "\",";
+  json += "\"sta_ipv6\":[";
+
+  esp_netif_t *staNetif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+  if (staActive && staNetif != nullptr) {
+    esp_ip6_addr_t addresses[LWIP_IPV6_NUM_ADDRESSES] = {};
+    const int addressCount = esp_netif_get_all_ip6(staNetif, addresses);
+    for (int i = 0; i < addressCount; ++i) {
+      String address = IPv6Address(addresses[i].addr).toString();
+      address.toLowerCase();
+      const char *scope = address.startsWith("fe80:") ? "link-local" : "global";
+      if (i > 0) json += ",";
+      json += "{\"address\":\"" + address + "\",\"scope\":\"" + String(scope) + "\"}";
+    }
+  }
+
+  json += "],";
+  json += "\"ap_ipv4\":\"" + String(apActive ? WiFi.softAPIP().toString() : "") + "\"}";
+  return json;
+}
+
 String buildLegacyPcStatusJson() {
   String status = "{";
   status += "\"pc0\":{\"GPIO\":\"5\",\"idx\":\"0\",\"stat\":\"" + getPcState() + "\"}";
@@ -427,6 +477,7 @@ String buildApSetupPage() {
   String usePowerLedChecked = usePowerLedPin ? "checked" : "";
   String powerLedWrapDisplay = usePowerLedPin ? "block" : "none";
   String autoReconnectChecked = autoReconnectEnabled ? "checked" : "";
+  String useIpv6Checked = useIpv6Enabled ? "checked" : "";
   String removePasswordDisplay = adminPasswordHash.length() > 0 ? "flex" : "none";
 
   String html = R"HTML(
@@ -455,15 +506,30 @@ String buildApSetupPage() {
     .danger-zone button:hover { background: #fbe4e1; }
     .small { margin-top: 7px; color: #637069; font-size: .78rem; line-height: 1.5; }
     .status { margin-top: 16px; padding: 12px 13px; border-radius: 6px; background: #f3f5f2; color: #637069; font-size: .82rem; }
+    .network-info { margin-bottom: 24px; padding-bottom: 22px; border-bottom: 1px solid #d4dbd5; }
+    .network-info h2 { margin: 0 0 12px; color: #173d2d; font-size: 1.08rem; }
+    .network-row { display: grid; grid-template-columns: 130px minmax(0, 1fr); gap: 12px; padding: 8px 0; border-bottom: 1px solid #edf1ec; font-size: .86rem; }
+    .network-row:last-child { border-bottom: 0; }
+    .network-label { color: #637069; font-weight: 700; }
+    .network-value { overflow-wrap: anywhere; font-family: Consolas, monospace; }
+    .network-links-title { margin: 16px 0 4px; color: #173d2d; font-size: .9rem; }
+    .network-link { color: #126247; text-decoration-thickness: 1px; text-underline-offset: 3px; }
+    .network-link:hover { color: #0e2d20; }
     .check-row { display: flex; align-items: flex-start; gap: 10px; font-weight: 600; }
     .check-row input { width: 18px; min-height: 18px; margin: 2px 0 0; }
-    @media (max-width: 520px) { body { padding: 22px 10px 40px; } .card { padding: 22px 18px; } }
+    @media (max-width: 520px) { body { padding: 22px 10px 40px; } .card { padding: 22px 18px; } .network-row { grid-template-columns: 1fr; gap: 2px; } }
   </style>
 </head>
 <body>
   <div class="wrap">
     <h1>ESP32 Wake Setup</h1>
     <div class="card">
+      <section class="network-info" aria-labelledby="networkInfoTitle">
+        <h2 id="networkInfoTitle">Network addresses</h2>
+        <div id="networkRows" aria-live="polite">
+          <div class="network-row"><span class="network-label">Status</span><span class="network-value">Loading...</span></div>
+        </div>
+      </section>
       <form id="configForm" method="POST">
         <label>WiFi network</label>
         <select id="ssidSelect" name="ssid">
@@ -504,6 +570,11 @@ String buildApSetupPage() {
           Automatically reconnect to the saved WiFi network after an outage
         </label>
 
+        <label class="check-row">
+          <input type="checkbox" id="useIpv6" name="use_ipv6" value="1" )HTML" + useIpv6Checked + R"HTML(>
+          Use IPv6 and retry when an IPv6 address is unavailable
+        </label>
+
         <button type="submit">Save configuration</button>
       </form>
 
@@ -527,6 +598,80 @@ String buildApSetupPage() {
     document.getElementById('configForm').action = routeBase + 'api/config';
     const savedSsid = ")HTML" + ssidValue + R"HTML(";
     const select = document.getElementById('ssidSelect');
+
+    function addNetworkRow(container, label, value) {
+      const row = document.createElement('div');
+      row.className = 'network-row';
+      const labelElement = document.createElement('span');
+      labelElement.className = 'network-label';
+      labelElement.textContent = label;
+      const valueElement = document.createElement('span');
+      valueElement.className = 'network-value';
+      valueElement.textContent = value || 'Not assigned';
+      row.append(labelElement, valueElement);
+      container.appendChild(row);
+    }
+
+    function addNetworkLink(container, label, url) {
+      const row = document.createElement('div');
+      row.className = 'network-row';
+      const labelElement = document.createElement('span');
+      labelElement.className = 'network-label';
+      labelElement.textContent = label;
+      const link = document.createElement('a');
+      link.className = 'network-value network-link';
+      link.href = url;
+      link.textContent = url;
+      row.append(labelElement, link);
+      container.appendChild(row);
+    }
+
+    function buildDeviceUrl(scheme, address, port) {
+      const host = address.includes(':') ? '[' + address + ']' : address;
+      return scheme + '://' + host + ':' + port + '/';
+    }
+
+    async function loadNetworkInfo() {
+      const rows = document.getElementById('networkRows');
+      try {
+        const response = await fetch(routeBase + 'api/network', { credentials: 'same-origin' });
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        const info = await response.json();
+        rows.replaceChildren();
+        addNetworkRow(rows, 'Mode', info.mode);
+        addNetworkRow(rows, 'STA IPv4', info.sta_ipv4);
+        (info.sta_ipv6 || []).forEach((entry) => {
+          addNetworkRow(rows, 'STA IPv6 (' + entry.scope + ')', entry.address);
+        });
+        if (!info.sta_ipv6 || info.sta_ipv6.length === 0) {
+          addNetworkRow(rows, 'STA IPv6', 'Not assigned');
+        }
+        if (info.ap_ipv4) addNetworkRow(rows, 'AP IPv4', info.ap_ipv4);
+
+        const linksTitle = document.createElement('h3');
+        linksTitle.className = 'network-links-title';
+        linksTitle.textContent = 'Connection URLs';
+        rows.appendChild(linksTitle);
+        if (info.sta_ipv4) {
+          addNetworkLink(rows, 'IPv4 HTTP', buildDeviceUrl('http', info.sta_ipv4, info.http_port));
+          addNetworkLink(rows, 'IPv4 HTTPS', buildDeviceUrl('https', info.sta_ipv4, info.https_port));
+        }
+        (info.sta_ipv6 || []).forEach((entry) => {
+          addNetworkLink(rows, 'IPv6 HTTP', buildDeviceUrl('http', entry.address, info.http_port));
+          addNetworkLink(rows, 'IPv6 HTTPS', buildDeviceUrl('https', entry.address, info.https_port));
+        });
+        if (info.ap_ipv4) {
+          addNetworkLink(rows, 'Setup AP', buildDeviceUrl('http', info.ap_ipv4, 80));
+        }
+      } catch (err) {
+        rows.replaceChildren();
+        addNetworkRow(rows, 'Status', 'Unable to read network addresses');
+      }
+    }
+
+    loadNetworkInfo();
+    window.setInterval(loadNetworkInfo, 10000);
+
     if (savedSsid) {
       const option = document.createElement('option');
       option.value = savedSsid;
@@ -829,7 +974,7 @@ void handleSaveConfig(HTTPRequest * req, HTTPResponse * res) {
   uint16_t previousConfigPort = configPort;
 
   std::string ssidCustomField, ssidSelectField, passwordField, targetIpFieldValue, portFieldValue;
-  std::string usePowerLedField, powerLedPinField, adminPasswordField, removeAdminPasswordField, autoReconnectField;
+  std::string usePowerLedField, powerLedPinField, adminPasswordField, removeAdminPasswordField, autoReconnectField, useIpv6Field;
 
   HTTPURLEncodedBodyParser parser(req);
   while (parser.nextField()) {
@@ -851,6 +996,7 @@ void handleSaveConfig(HTTPRequest * req, HTTPResponse * res) {
     else if (name == "admin_password") adminPasswordField = value;
     else if (name == "remove_admin_password") removeAdminPasswordField = value;
     else if (name == "auto_reconnect") autoReconnectField = value;
+    else if (name == "use_ipv6") useIpv6Field = value;
   }
 
   String ssidValue = ssidCustomField.length() > 0 ? String(ssidCustomField.c_str()) : String(ssidSelectField.c_str());
@@ -862,6 +1008,7 @@ void handleSaveConfig(HTTPRequest * req, HTTPResponse * res) {
   String adminPasswordValue = String(adminPasswordField.c_str());
   bool removeAdminPassword = (removeAdminPasswordField == "1" || removeAdminPasswordField == "on" || removeAdminPasswordField == "true");
   bool autoReconnectValue = (autoReconnectField == "1" || autoReconnectField == "on" || autoReconnectField == "true");
+  bool useIpv6Value = (useIpv6Field == "1" || useIpv6Field == "on" || useIpv6Field == "true");
 
   if (ssidValue.length() == 0) {
     res->setStatusCode(400);
@@ -874,6 +1021,13 @@ void handleSaveConfig(HTTPRequest * req, HTTPResponse * res) {
     res->setStatusCode(400);
     res->setHeader("Content-Type", "text/plain");
     res->print("power_led_pin must be different from the relay pin (" + String(RELAY_PIN) + ")");
+    return;
+  }
+
+  if (portValue.toInt() == 79 || portValue.toInt() == 80) {
+    res->setStatusCode(400);
+    res->setHeader("Content-Type", "text/plain");
+    res->print("port 79 and 80 are reserved for the Alexa bridge");
     return;
   }
 
@@ -892,6 +1046,8 @@ void handleSaveConfig(HTTPRequest * req, HTTPResponse * res) {
     adminPasswordHash = sha256Hex(adminPasswordValue);
   }
   autoReconnectEnabled = autoReconnectValue;
+  useIpv6Enabled = useIpv6Value;
+  lastIpv6RetryAt = millis();
   if (usePowerLedPin) {
     pinMode(powerLedPin, INPUT_PULLUP);
   }
@@ -1080,6 +1236,20 @@ void handleConfigReset(HTTPRequest * req, HTTPResponse * res) {
   resetConfigurationAndRestart(res);
 }
 
+void handleNetworkInfo(HTTPRequest * req, HTTPResponse * res) {
+  req->discardRequestBody();
+  if (!isConfigPageAuthorized(req)) {
+    res->setStatusCode(401);
+    res->setHeader("Content-Type", "application/json");
+    res->print("{\"error\":\"unauthorized\"}");
+    return;
+  }
+
+  res->setHeader("Cache-Control", "no-store");
+  res->setHeader("Content-Type", "application/json");
+  res->print(buildNetworkInfoJson());
+}
+
 void handleStatus(HTTPRequest * req, HTTPResponse * res) {
   if (!checkActionAuthorized(req, res)) return;
   res->setHeader("Content-Type", "text/plain");
@@ -1147,6 +1317,7 @@ void buildRoutes() {
   routeNodes.push_back(new ResourceNode("/login", "POST", &handleLogin));
   routeNodes.push_back(new ResourceNode("/api/config", "POST", &handleSaveConfig));
   routeNodes.push_back(new ResourceNode("/api/config/reset", "POST", &handleConfigReset));
+  routeNodes.push_back(new ResourceNode("/api/network", "GET", &handleNetworkInfo));
   routeNodes.push_back(new ResourceNode("/api/scan", "GET", &handleScan));
   routeNodes.push_back(new ResourceNode("/status", "GET", &handleStatus));
   routeNodes.push_back(new ResourceNode("/status", "POST", &handleStatus));
@@ -1236,7 +1407,7 @@ void beginFauxmo() {
 }
 
 void beginConfiguredServer() {
-  if (configPort < 1 || configPort > 65535) {
+  if (configPort < 1 || configPort > 65535 || configPort == 79 || configPort == 80) {
     configPort = DEFAULT_CONFIG_PORT;
   }
   httpsPort = (configPort >= 65535) ? configPort - 1 : configPort + 1;
@@ -1277,15 +1448,29 @@ bool connectToSavedWifi(uint32_t timeoutMs) {
   WiFi.disconnect(true);
   delay(100);
   WiFi.mode(WIFI_STA);
-  bool ipv6Enabled = WiFi.enableIpV6();
-  WiFi.setAutoReconnect(autoReconnectEnabled);
   WiFi.persistent(false);
+  WiFi.setAutoReconnect(autoReconnectEnabled);
   WiFi.setSleep(false);
+  ipv6LinkLocalAssigned = false;
+  ipv6GlobalAssigned = false;
+  lastIpv6RetryAt = millis();
   WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
   setStatusLed(false);
 
   Serial.printf("[STA] Connecting to %s\n", wifiSsid.c_str());
-  Serial.printf("[STA] IPv6 %s\n", ipv6Enabled ? "enabled" : "could not be enabled");
+  bool ipv6Enabled = false;
+  if (useIpv6Enabled) {
+    for (int attempt = 1; attempt <= 10 && !ipv6Enabled; ++attempt) {
+      ipv6Enabled = WiFi.enableIpV6();
+      if (!ipv6Enabled) {
+        Serial.printf("[STA] IPv6 netif not ready (attempt %d/10)\n", attempt);
+        delay(1000);
+      }
+    }
+    Serial.printf("[STA] IPv6 %s\n", ipv6Enabled ? "enabled" : "could not be enabled");
+  } else {
+    Serial.println("[STA] IPv6 disabled in settings");
+  }
 
   unsigned long start = millis();
   while (millis() - start < timeoutMs) {
@@ -1293,9 +1478,20 @@ bool connectToSavedWifi(uint32_t timeoutMs) {
       Serial.print("[STA] Connected, IP: ");
       Serial.println(WiFi.localIP());
       if (ipv6Enabled) {
+        const unsigned long ipv6WaitStart = millis();
+        while (!ipv6GlobalAssigned && millis() - ipv6WaitStart < 10000) {
+          delay(100);
+        }
         Serial.print("[STA] IPv6 link-local: ");
         Serial.println(WiFi.localIPv6());
+        if (!ipv6LinkLocalAssigned) {
+          Serial.println("[STA] No IPv6 link-local event was received.");
+        }
+        if (!ipv6GlobalAssigned) {
+          Serial.println("[STA] No global IPv6 after 10 seconds; check router IPv6, RA/SLAAC and firewall settings.");
+        }
       }
+      lastIpv6RetryAt = millis();
       setStatusLed(false);
       return true;
     }
@@ -1326,7 +1522,12 @@ void startStationMode() {
 
 void setup() {
   Serial.begin(115200);
-  delay(200);
+  const unsigned long serialWaitStart = millis();
+  while (!Serial && millis() - serialWaitStart < 2000) {
+    delay(10);
+  }
+  Serial.printf("\n[BOOT] ESP32 Wake started at 115200 baud; reset reason=%d\n", esp_reset_reason());
+  Serial.flush();
   WiFi.onEvent(handleWifiGotIPv6, ARDUINO_EVENT_WIFI_STA_GOT_IP6);
 
   pinMode(RELAY_PIN, OUTPUT);
@@ -1340,10 +1541,10 @@ void setup() {
   if (forceAccessPoint) {
     preferences.remove("force_ap_once");
   }
-  bool pendingFactoryReset = preferences.getBool("factory_reset_pending", false);
+  bool pendingFactoryReset = preferences.getBool("fac_rs_pd", false);
   if (pendingFactoryReset) {
     Serial.println("[CFG] Pending factory reset detected. Forcing AP mode.");
-    preferences.remove("factory_reset_pending");
+    preferences.remove("fac_rs_pd");
     preferences.clear();
     wifiSsid = "";
     wifiPassword = "";
@@ -1353,6 +1554,7 @@ void setup() {
     powerLedPin = DEFAULT_POWER_LED_PIN;
     adminPasswordHash = DEFAULT_ADMIN_PASSWORD_HASH;
     autoReconnectEnabled = DEFAULT_AUTO_RECONNECT_ENABLED;
+    useIpv6Enabled = DEFAULT_USE_IPV6;
   } else if (!isFactoryResetRequested()) {
     if (preferences.isKey("wifi_ssid")) {
       wifiSsid = preferences.getString("wifi_ssid");
@@ -1365,6 +1567,7 @@ void setup() {
     powerLedPin = preferences.getInt("pwrled_pin", DEFAULT_POWER_LED_PIN);
     adminPasswordHash = preferences.getString("admin_pwd_hash", DEFAULT_ADMIN_PASSWORD_HASH);
     autoReconnectEnabled = preferences.getBool("auto_reconnect", DEFAULT_AUTO_RECONNECT_ENABLED);
+    useIpv6Enabled = preferences.getBool("use_ipv6", DEFAULT_USE_IPV6);
   }
   preferences.end();
 
@@ -1391,6 +1594,19 @@ void loop() {
   if (dnsServerActive) dnsServer.processNextRequest();
   if (fauxmoStarted) fauxmo.handle();
 
+  static unsigned long lastSerialStatusAt = 0;
+  if (millis() - lastSerialStatusAt >= 30000) {
+    lastSerialStatusAt = millis();
+    Serial.printf("[SYS] uptime=%lus heap=%u WiFi=%s IPv4=%s IPv6=%s globalIPv6=%s RSSI=%d\n",
+                  millis() / 1000,
+                  ESP.getFreeHeap(),
+                  WiFi.status() == WL_CONNECTED ? "connected" : "disconnected",
+                  WiFi.localIP().toString().c_str(),
+                  WiFi.localIPv6().toString().c_str(),
+                  ipv6GlobalAssigned ? "yes" : "no",
+                  WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0);
+  }
+
   if (pendingServerAction != PendingServerAction::NONE && millis() >= pendingServerActionAt) {
     PendingServerAction action = pendingServerAction;
     pendingServerAction = PendingServerAction::NONE;
@@ -1402,6 +1618,17 @@ void loop() {
       beginConfiguredServer();
     } else {
       startAccessPoint();
+    }
+  }
+
+  if (WiFi.getMode() == WIFI_STA && WiFi.status() == WL_CONNECTED && useIpv6Enabled &&
+      (!ipv6LinkLocalAssigned || !ipv6GlobalAssigned) && millis() - lastIpv6RetryAt >= 60000) {
+    lastIpv6RetryAt = millis();
+    Serial.printf("[STA] IPv6 still incomplete (link-local=%s, global=%s); retrying IPv6 setup.\n",
+                  ipv6LinkLocalAssigned ? "yes" : "no",
+                  ipv6GlobalAssigned ? "yes" : "no");
+    if (!WiFi.enableIpV6()) {
+      Serial.println("[STA] IPv6 retry could not be started.");
     }
   }
 
