@@ -57,13 +57,16 @@ unsigned long pendingServerActionAt = 0;
 fauxmoESP fauxmo;
 bool fauxmoStarted = false;
 
+String sha256Hex(const String &input);
+
 // Default values applied on first boot and factory reset. Change a default here only;
 // every other place in the file reads from these constants instead of repeating literals.
 const char *const DEFAULT_TARGET_IP = "192.168.1.135";
 const uint16_t DEFAULT_CONFIG_PORT = 2443;
 const bool DEFAULT_USE_POWER_LED_PIN = false;
 const int DEFAULT_POWER_LED_PIN = 2;
-const char *const DEFAULT_ADMIN_PASSWORD_HASH = "";
+String adminPasswordHashStorage = sha256Hex(AP_PASSWORD);
+const char *const DEFAULT_ADMIN_PASSWORD_HASH = adminPasswordHashStorage.c_str();
 const bool DEFAULT_AUTO_RECONNECT_ENABLED = true;
 const bool DEFAULT_USE_IPV6 = true;
 
@@ -212,8 +215,6 @@ void clearSavedConfig() {
   preferences.clear();
   preferences.putBool("fac_rs_pd", true);
   preferences.end();
-
-  Serial.println("[CFG] All saved settings cleared and reset flag set.");
 }
 
 void setStatusLed(bool enabled) {
@@ -1039,9 +1040,9 @@ void handleSaveConfig(HTTPRequest * req, HTTPResponse * res) {
   }
   usePowerLedPin = useLedValue;
   powerLedPin = ledPinValue;
-  if (removeAdminPassword) {
-    adminPasswordHash = "";
-    sessionToken = "";
+  if (removeAdminPassword || adminPasswordHash.length() == 0) {
+    adminPasswordHash = DEFAULT_ADMIN_PASSWORD_HASH;
+    // sessionToken = "";
   } else if (adminPasswordValue.length() > 0) {
     adminPasswordHash = sha256Hex(adminPasswordValue);
   }
@@ -1493,6 +1494,7 @@ bool connectToSavedWifi(uint32_t timeoutMs) {
       }
       lastIpv6RetryAt = millis();
       setStatusLed(false);
+      Serial.printf("[CFG] Admin password hash: %s\n", DEFAULT_ADMIN_PASSWORD_HASH);
       return true;
     }
     delay(500);
