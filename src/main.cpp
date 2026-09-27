@@ -215,6 +215,8 @@ void clearSavedConfig() {
   preferences.clear();
   preferences.putBool("fac_rs_pd", true);
   preferences.end();
+
+  Serial.println("[CFG] All saved settings cleared and reset flag set.");
 }
 
 void setStatusLed(bool enabled) {
@@ -891,10 +893,15 @@ bool isConfigPageAuthorized(HTTPRequest * req) {
   return token.length() > 0 && token == sessionToken;
 }
 
+// check req is https
+bool isRequestSecure(HTTPRequest * req) {
+  return req->isSecure();
+}
+
 // Config page is reachable through the normal STA port too, not just while in AP setup mode,
 // so the device never has to be re-flashed or reset just to change its settings later.
 void handleRoot(HTTPRequest * req, HTTPResponse * res) {
-  if (!isConfigPageAuthorized(req)) {
+  if (!isConfigPageAuthorized(req) || isRequestSecure(req)) {
     res->setHeader("Content-Type", "text/html");
     res->print(buildLoginPage(""));
     return;
@@ -1320,12 +1327,6 @@ void buildRoutes() {
   routeNodes.push_back(new ResourceNode("/api/config/reset", "POST", &handleConfigReset));
   routeNodes.push_back(new ResourceNode("/api/network", "GET", &handleNetworkInfo));
   routeNodes.push_back(new ResourceNode("/api/scan", "GET", &handleScan));
-  routeNodes.push_back(new ResourceNode("/status", "GET", &handleStatus));
-  routeNodes.push_back(new ResourceNode("/status", "POST", &handleStatus));
-  routeNodes.push_back(new ResourceNode("/stt", "GET", &handleStatus));
-  routeNodes.push_back(new ResourceNode("/stt", "POST", &handleStatus));
-  routeNodes.push_back(new ResourceNode("/status", "OPTIONS", &handleApiPreflight));
-  routeNodes.push_back(new ResourceNode("/stt", "OPTIONS", &handleApiPreflight));
 
   // Known OS captive-portal probe URLs (Android, iOS/macOS, Windows) get an immediate, explicit
   // response instead of falling through to the generic catch-all redirect.
@@ -1341,6 +1342,7 @@ void buildRoutes() {
   // this device currently has a control password.
   struct ActionRoute { const char *path; HTTPSCallbackFunction *handler; };
   const ActionRoute actionRoutes[] = {
+    {"status", &handleStatus}, {"/stt", &handleStatus},
     {"/wake", &handleWake}, {"/pw", &handleWake},
     {"/shutdown", &handleShutdown}, {"/sd", &handleShutdown}, {"/fsd", &handleShutdown},
     {"/reset", &handleReset}, {"/api/reset", &handleReset}, {"/rs", &handleReset},
@@ -1494,7 +1496,6 @@ bool connectToSavedWifi(uint32_t timeoutMs) {
       }
       lastIpv6RetryAt = millis();
       setStatusLed(false);
-      Serial.printf("[CFG] Admin password hash: %s\n", DEFAULT_ADMIN_PASSWORD_HASH);
       return true;
     }
     delay(500);
