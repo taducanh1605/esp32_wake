@@ -901,7 +901,7 @@ bool isRequestSecure(HTTPRequest * req) {
 // Config page is reachable through the normal STA port too, not just while in AP setup mode,
 // so the device never has to be re-flashed or reset just to change its settings later.
 void handleRoot(HTTPRequest * req, HTTPResponse * res) {
-  if (!isConfigPageAuthorized(req) || isRequestSecure(req)) {
+  if (!isConfigPageAuthorized(req)) {
     res->setHeader("Content-Type", "text/html");
     res->print(buildLoginPage(""));
     return;
