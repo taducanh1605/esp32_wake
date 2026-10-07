@@ -84,10 +84,47 @@ The client-side password state must match the ESP32 password state. A client tha
 | Configuration page | `/` | None | `GET` |
 | Configuration login | `/login` | None | `POST` |
 | Scan WiFi | `/api/scan` | None | `GET` |
+| Network addresses and hostname status | `/api/network` | None | `GET` |
 | Save configuration | `/api/config` | None | `POST` |
 | Reset from configuration page | `/api/config/reset` | None | `POST` |
 
 Use the authentication contract above for status, wake, shutdown, and reset endpoints.
+
+## USB discovery and DuckDNS
+
+`GET /api/network` requires the configuration-page session (or AP setup access), not the status endpoint's password form. It adds `esp_hostname`, `pc_hostname`, `ddns_enabled`, `esp_ddns_status`, `pc_ddns_status`, `pc_detection`, `pc_ipv4`, and `pc_ipv6` to the existing network data. Hostnames are configured names, not proof that DNS has propagated. Use the DDNS status fields to check update results. No token is returned.
+
+Use `https://{esp_hostname}:{https_port}/` for the ESP32 link. Do not assume HTTPS uses 443 or use `http_port` for an HTTPS URL. Copy `pc_hostname` without the ESP32 port for streaming clients.
+
+Additional URL-encoded fields for `POST /api/config`:
+
+| Field | Meaning |
+|---|---|
+| `pc_auto=1` | Allow the Windows USB helper to update PC addresses; absent means manual. |
+| `target_ip` | Manual PC LAN IPv4; may be empty if global IPv6 is provided. |
+| `pc_ipv6` | Manual PC global IPv6; may be empty if LAN IPv4 is provided. |
+| `ddns_enabled=1` | Enable DuckDNS AAAA updates; absent means disabled. |
+| `ddns_token` | DuckDNS account UUID token; blank retains the saved token. Never send it in a query string. |
+| `esp_host`, `pc_host` | Two different, already registered DuckDNS names. Accept subnames or full `.duckdns.org` names. |
+
+When DDNS is enabled, `use_ipv6=1`, a valid token, and both different names are required. Manual addresses are validated; automatic mode ignores submitted manual addresses. Configurations without these new checkboxes disable the corresponding features. `target_ip` in status/save responses remains the selected address, preferring IPv6 when enabled. The ping check supports IPv6 and falls back to the saved LAN IPv4.
+
+The USB protocol is ASCII, LF-delimited, 115200 baud, with DTR/RTS disabled. The Windows helper opens COM only for a handshake and network report, then closes it even on errors. Each transaction uses a new nonce. COM is not held between IP checks/heartbeats; a busy port is retried rather than interrupting flashing or Serial Monitor:
+
+```text
+PC:    WAKE_HELLO <32-hex nonce>
+ESP32: WAKE_DEVICE <nonce> <MAC>
+PC:    WAKE_NET <nonce> <LAN IPv4 or -> <global IPv6 or ->
+ESP32: WAKE_ACK <nonce> AUTO|MANUAL|INVALID
+```
+
+Firmware only accepts a network report after a matching handshake. Lines are bounded to 255 characters; malformed/oversized lines are discarded. `MANUAL` acknowledges a valid report without modifying addresses. Physical USB access is trusted; the nonce prevents accidental mixing of discovery replies, not malicious physical access. Logs can be interleaved with protocol replies.
+
+ESP32 manages both DuckDNS hostnames; Windows only reports PC addresses over USB. Before an update, the worker queries AAAA through Google DNS-over-HTTPS (`dns.google`), with certificate verification and bounded timeouts. A matching IPv6 skips the DuckDNS update API, including after reboot; comparisons use binary IPv6 rather than text. Unchanged addresses are checked approximately every five minutes. Changed addresses are checked sooner, subject to failure backoff. A successful lookup with a different or absent AAAA triggers one update; lookup/JSON/TLS failures trigger backoff, not a blind update. Status may be `Checking DNS`, `DNS matches; no update needed`, `Updated`, or a retry/error message. DNS caches may retain an old address until its TTL expires.
+
+Updates no longer clear A/AAAA first. Existing IPv4 A records are not explicitly cleared; review those records in DuckDNS if the hostname should be IPv6-only.
+
+If the ESP32 global `/64` changes and the saved PC IPv6 shared the previously observed ESP32 `/64`, firmware replaces the PC's prefix, preserving its last 64 bits. The previous ESP32 prefix and inferred PC address survive reboot. Unknown previous prefixes and different PC subnets are not rebased. Changing the configured WiFi SSID discards the prefix baseline. This inference does not reconfigure Windows and assumes an unchanged interface identifier; privacy/stable-address generation can change that identifier after renumbering. The next accepted helper report overrides the inferred address with the actual address. Automatic-mode PC DDNS normally requires a heartbeat within three minutes, but an inferred address after a confirmed shared-prefix change can be published while the PC is asleep.
 
 ## Status
 

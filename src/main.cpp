@@ -9,6 +9,11 @@
 #include <lwip/opt.h>
 #include <DNSServer.h>
 #include <vector>
+#include <time.h>
+#include <esp_http_client.h>
+#include <cJSON.h>
+#include "network_policy.h"
+#include "ddns_ca.h"
 
 #include <HTTPServer.hpp>
 #include <HTTPSServer.hpp>
@@ -19,6 +24,9 @@
 #include <HTTPURLEncodedBodyParser.hpp>
 #include "tls_cert.h"
 #include <fauxmoESP.h>
+#ifdef WAKE_POLICY_TEST
+#include "../tests/network_policy_checks.h"
+#endif
 
 using namespace httpsserver;
 
@@ -85,6 +93,389 @@ unsigned long lastIpv6RetryAt = 0;
 String sessionToken = "";
 volatile bool ipv6LinkLocalAssigned = false;
 volatile bool ipv6GlobalAssigned = false;
+esp_ip6_addr_t latestGlobalIpv6 = {};
+portMUX_TYPE ipv6AddressMux = portMUX_INITIALIZER_UNLOCKED;
+
+bool autoDetectPc = false;
+String pcIpv4 = DEFAULT_TARGET_IP;
+String pcIpv6;
+String lastEspIpv6;
+bool pcIpv6Inferred = false;
+bool ddnsEnabled = false;
+String ddnsToken;
+String espHostname;
+String pcHostname;
+String serialNonce;
+unsigned long lastPcReportAt = 0;
+bool pcReportReceived = false;
+uint32_t ddnsRevision = 0;
+bool ddnsBusy = false;
+bool ddnsNextPc = false;
+QueueHandle_t ddnsJobQueue = nullptr;
+QueueHandle_t ddnsResultQueue = nullptr;
+
+struct DdnsRecordState {
+  String publishedIp;
+  String status = "Not updated";
+  unsigned long lastAttempt = 0;
+  uint8_t failures = 0;
+  bool attempted = false;
+};
+DdnsRecordState espDdnsState, pcDdnsState;
+
+struct DdnsJob {
+  char label[64];
+  char token[37];
+  char ipv6[46];
+  uint32_t revision;
+  bool pc;
+};
+struct DdnsResult {
+  DdnsJob job;
+  int code;
+};
+struct DdnsResponse {
+  char text[2048] = {};
+  size_t length = 0;
+  bool overflow = false;
+};
+
+bool isGlobalIpv6(const String &address) {
+  ip_addr_t parsed;
+  return ipaddr_aton(address.c_str(), &parsed) && IP_IS_V6(&parsed) &&
+         wakepolicy::isGlobalIpv6Prefix(lwip_ntohl(ip_2_ip6(&parsed)->addr[0]) >> 16);
+}
+
+bool isPrivateIpv4(const String &address) {
+  IPAddress parsed;
+  if (!parsed.fromString(address)) return false;
+  return parsed[0] == 10 || (parsed[0] == 172 && parsed[1] >= 16 && parsed[1] <= 31) ||
+         (parsed[0] == 192 && parsed[1] == 168);
+}
+
+String currentGlobalIpv6() {
+  if (!useIpv6Enabled || WiFi.status() != WL_CONNECTED) return "";
+  esp_netif_t *staNetif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+  if (!staNetif) return "";
+  esp_ip6_addr_t addresses[LWIP_IPV6_NUM_ADDRESSES] = {};
+  const int count = esp_netif_get_all_ip6(staNetif, addresses);
+  esp_ip6_addr_t latest;
+  portENTER_CRITICAL(&ipv6AddressMux);
+  latest = latestGlobalIpv6;
+  portEXIT_CRITICAL(&ipv6AddressMux);
+  for (int index = 0; index < count; ++index) {
+    if (memcmp(addresses[index].addr, latest.addr, 16) == 0) {
+      String address = IPv6Address(addresses[index].addr).toString();
+      if (isGlobalIpv6(address)) return address;
+    }
+  }
+  for (int index = 0; index < count; ++index) {
+    String address = IPv6Address(addresses[index].addr).toString();
+    if (isGlobalIpv6(address)) return address;
+  }
+  return "";
+}
+
+void selectPcTarget() {
+  targetIp = useIpv6Enabled && isGlobalIpv6(pcIpv6) ? pcIpv6 : pcIpv4;
+}
+
+bool sameIpv6(const String &first, const String &second) {
+  ip_addr_t firstAddress, secondAddress;
+  return ipaddr_aton(first.c_str(), &firstAddress) && IP_IS_V6(&firstAddress) &&
+         ipaddr_aton(second.c_str(), &secondAddress) && IP_IS_V6(&secondAddress) &&
+         memcmp(ip_2_ip6(&firstAddress)->addr, ip_2_ip6(&secondAddress)->addr, 16) == 0;
+}
+
+uint64_t ipv6Prefix(const ip_addr_t &address) {
+  return (static_cast<uint64_t>(lwip_ntohl(ip_2_ip6(&address)->addr[0])) << 32) |
+         lwip_ntohl(ip_2_ip6(&address)->addr[1]);
+}
+
+void syncPcIpv6Prefix() {
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck < 1000) return;
+  lastCheck = millis();
+  String currentEsp = currentGlobalIpv6();
+  if (!isGlobalIpv6(currentEsp)) return;
+  ip_addr_t currentAddress, previousAddress, pcAddress;
+  ipaddr_aton(currentEsp.c_str(), &currentAddress);
+  bool hadPrevious = isGlobalIpv6(lastEspIpv6) && ipaddr_aton(lastEspIpv6.c_str(), &previousAddress);
+  if (hadPrevious && ipv6Prefix(previousAddress) == ipv6Prefix(currentAddress)) return;
+  bool rebase = hadPrevious && isGlobalIpv6(pcIpv6) && ipaddr_aton(pcIpv6.c_str(), &pcAddress) &&
+                wakepolicy::canRebasePcPrefix(ipv6Prefix(previousAddress), ipv6Prefix(currentAddress), ipv6Prefix(pcAddress));
+  if (rebase) {
+    ip_2_ip6(&pcAddress)->addr[0] = ip_2_ip6(&currentAddress)->addr[0];
+    ip_2_ip6(&pcAddress)->addr[1] = ip_2_ip6(&currentAddress)->addr[1];
+    pcIpv6 = ipaddr_ntoa(&pcAddress);
+    pcIpv6Inferred = true;
+    pcDdnsState.attempted = false;
+    pcDdnsState.failures = 0;
+    selectPcTarget();
+  }
+  lastEspIpv6 = currentEsp;
+  preferences.begin(CONFIG_NAMESPACE, false);
+  preferences.putString("esp_ipv6", lastEspIpv6);
+  if (rebase) {
+    preferences.putString("pc_ipv6", pcIpv6);
+    preferences.putBool("pc_inferred", pcIpv6Inferred);
+    preferences.putString("target_ip", targetIp);
+  }
+  preferences.end();
+}
+
+String normalizeDuckLabel(String value) {
+  value.trim();
+  value.toLowerCase();
+  if (value.endsWith(".duckdns.org")) value.remove(value.length() - 12);
+  return value;
+}
+
+void loadDiscoveryConfig() {
+  autoDetectPc = preferences.getBool("pc_auto", false);
+  pcIpv4 = preferences.getString("pc_ipv4", isPrivateIpv4(targetIp) ? targetIp : "");
+  pcIpv6 = preferences.getString("pc_ipv6", isGlobalIpv6(targetIp) ? targetIp : "");
+  lastEspIpv6 = preferences.getString("esp_ipv6", "");
+  pcIpv6Inferred = preferences.getBool("pc_inferred", false);
+  ddnsEnabled = preferences.getBool("ddns_enabled", false);
+  ddnsToken = preferences.getString("ddns_token", "");
+  espHostname = preferences.getString("esp_host", "");
+  pcHostname = preferences.getString("pc_host", "");
+  selectPcTarget();
+}
+
+void resetDiscoveryConfig() {
+  autoDetectPc = false;
+  pcIpv4 = DEFAULT_TARGET_IP;
+  pcIpv6 = "";
+  lastEspIpv6 = "";
+  pcIpv6Inferred = false;
+  ddnsEnabled = false;
+  ddnsToken = "";
+  espHostname = "";
+  pcHostname = "";
+  ++ddnsRevision;
+  espDdnsState = DdnsRecordState();
+  pcDdnsState = DdnsRecordState();
+}
+
+void handleSerialLine(char *line) {
+  char *context = nullptr;
+  char *command = strtok_r(line, " ", &context);
+  char *nonce = strtok_r(nullptr, " ", &context);
+  if (!command || !nonce || strlen(nonce) != 32) return;
+  for (size_t index = 0; index < 32; ++index) if (!wakepolicy::isHex(nonce[index])) return;
+  if (strcmp(command, "WAKE_HELLO") == 0 && !strtok_r(nullptr, " ", &context)) {
+    serialNonce = nonce;
+    Serial.printf("WAKE_DEVICE %s %s\n", nonce, WiFi.macAddress().c_str());
+    return;
+  }
+  if (strcmp(command, "WAKE_NET") != 0 || serialNonce != nonce) return;
+  char *ipv4 = strtok_r(nullptr, " ", &context);
+  char *ipv6 = strtok_r(nullptr, " ", &context);
+  if (!ipv4 || !ipv6 || strtok_r(nullptr, " ", &context)) return;
+  String newIpv4 = strcmp(ipv4, "-") == 0 ? "" : ipv4;
+  String newIpv6 = strcmp(ipv6, "-") == 0 ? "" : ipv6;
+  if ((newIpv4.length() && !isPrivateIpv4(newIpv4)) || (newIpv6.length() && !isGlobalIpv6(newIpv6))) {
+    Serial.printf("WAKE_ACK %s INVALID\n", nonce);
+    return;
+  }
+  lastPcReportAt = millis();
+  pcReportReceived = true;
+  if (autoDetectPc && (pcIpv4 != newIpv4 || pcIpv6 != newIpv6 || pcIpv6Inferred)) {
+    pcIpv4 = newIpv4;
+    pcIpv6 = newIpv6;
+    pcIpv6Inferred = false;
+    selectPcTarget();
+    pcDdnsState.attempted = false;
+    preferences.begin(CONFIG_NAMESPACE, false);
+    preferences.putString("pc_ipv4", pcIpv4);
+    preferences.putString("pc_ipv6", pcIpv6);
+    preferences.putBool("pc_inferred", false);
+    preferences.putString("target_ip", targetIp);
+    preferences.end();
+  }
+  Serial.printf("WAKE_ACK %s %s\n", nonce, autoDetectPc ? "AUTO" : "MANUAL");
+}
+
+void pollSerialHelper() {
+  static char line[256];
+  static size_t length = 0;
+  static bool overflow = false;
+  size_t budget = 512;
+  while (Serial.available() && budget-- > 0) {
+    char value = Serial.read();
+    if (value == '\r') continue;
+    if (value == '\n') {
+      if (!overflow) { line[length] = '\0'; handleSerialLine(line); }
+      length = 0;
+      overflow = false;
+    } else if (value < 32 || value > 126 || length >= sizeof(line) - 1) {
+      overflow = true;
+    } else if (!overflow) {
+      line[length++] = value;
+    }
+  }
+}
+
+esp_err_t handleDdnsHttpEvent(esp_http_client_event_t *event) {
+  if (event->event_id == HTTP_EVENT_ON_DATA) {
+    auto *response = static_cast<DdnsResponse *>(event->user_data);
+    size_t count = std::min(static_cast<size_t>(event->data_len), sizeof(response->text) - 1 - response->length);
+    response->overflow |= count != static_cast<size_t>(event->data_len);
+    memcpy(response->text + response->length, event->data, count);
+    response->length += count;
+    response->text[response->length] = '\0';
+  }
+  return ESP_OK;
+}
+
+int fetchDdnsUrl(const String &url, const char *rootCa, DdnsResponse &response) {
+  esp_http_client_config_t config = {};
+  config.url = url.c_str();
+  config.cert_pem = rootCa;
+  config.timeout_ms = 6000;
+  config.disable_auto_redirect = true;
+  config.event_handler = handleDdnsHttpEvent;
+  config.user_data = &response;
+  esp_http_client_handle_t client = esp_http_client_init(&config);
+  if (!client) return -1;
+  esp_err_t error = esp_http_client_perform(client);
+  int status = esp_http_client_get_status_code(client);
+  esp_http_client_cleanup(client);
+  if (error != ESP_OK) return -1;
+  if (status != 200) return status;
+  return response.overflow ? -3 : 0;
+}
+
+int sendDuckUpdate(const String &url) {
+  DdnsResponse response;
+  int code = fetchDdnsUrl(url, DDNS_ROOT_CA, response);
+  if (code != 0) return code;
+  String body(response.text);
+  body.trim();
+  return body == "OK" ? 0 : -2;
+}
+
+int checkDuckAddress(const DdnsJob &job) {
+  String name = String(job.label) + ".duckdns.org";
+  DdnsResponse response;
+  int code = fetchDdnsUrl("https://dns.google/resolve?name=" + name + "&type=AAAA", DNS_ROOT_CA, response);
+  if (code != 0) return code;
+  cJSON *document = cJSON_Parse(response.text);
+  if (!document) return -3;
+  const cJSON *status = cJSON_GetObjectItemCaseSensitive(document, "Status");
+  const cJSON *questions = cJSON_GetObjectItemCaseSensitive(document, "Question");
+  const cJSON *question = cJSON_GetArrayItem(questions, 0);
+  const cJSON *questionName = cJSON_GetObjectItemCaseSensitive(question, "name");
+  const cJSON *questionType = cJSON_GetObjectItemCaseSensitive(question, "type");
+  bool valid = cJSON_IsNumber(status) && (status->valueint == 0 || status->valueint == 3) &&
+               !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(document, "TC")) &&
+               cJSON_IsString(questionName) && String(questionName->valuestring) == name + "." &&
+               cJSON_IsNumber(questionType) && questionType->valueint == 28;
+  int count = 0;
+  bool matches = false;
+  const cJSON *answers = cJSON_GetObjectItemCaseSensitive(document, "Answer");
+  if (answers && !cJSON_IsArray(answers)) valid = false;
+  const cJSON *answer = nullptr;
+  cJSON_ArrayForEach(answer, answers) {
+    const cJSON *type = cJSON_GetObjectItemCaseSensitive(answer, "type");
+    if (!cJSON_IsNumber(type) || type->valueint != 28) continue;
+    const cJSON *data = cJSON_GetObjectItemCaseSensitive(answer, "data");
+    const cJSON *owner = cJSON_GetObjectItemCaseSensitive(answer, "name");
+    if (!cJSON_IsString(owner) || String(owner->valuestring) != name + "." ||
+        !cJSON_IsString(data) || !isGlobalIpv6(String(data->valuestring))) {
+      valid = false;
+      continue;
+    }
+    ++count;
+    matches |= sameIpv6(String(data->valuestring), String(job.ipv6));
+  }
+  cJSON_Delete(document);
+  return valid ? (count == 1 && matches ? 0 : 1) : -3;
+}
+
+void ddnsWorker(void *) {
+  DdnsJob job;
+  while (true) {
+    if (xQueueReceive(ddnsJobQueue, &job, portMAX_DELAY) != pdTRUE) continue;
+    int check = checkDuckAddress(job);
+    int code = check < 0 || check > 1 ? check : 1;
+    if (wakepolicy::shouldUpdateDuckRecord(check == 0 || check == 1, check == 0)) {
+      String url = "https://www.duckdns.org/update?domains=" + String(job.label) + "&token=" + String(job.token);
+      code = sendDuckUpdate(url + "&ipv6=" + String(job.ipv6));
+    }
+    DdnsResult result = {job, code};
+    xQueueSend(ddnsResultQueue, &result, portMAX_DELAY);
+    memset(&job, 0, sizeof(job));
+    memset(&result, 0, sizeof(result));
+  }
+}
+
+void startDdnsWorker() {
+  ddnsJobQueue = xQueueCreate(1, sizeof(DdnsJob));
+  ddnsResultQueue = xQueueCreate(1, sizeof(DdnsResult));
+  if (!ddnsJobQueue || !ddnsResultQueue || xTaskCreate(ddnsWorker, "duckdns", 8192, nullptr, 1, nullptr) != pdPASS) {
+    if (ddnsJobQueue) vQueueDelete(ddnsJobQueue);
+    if (ddnsResultQueue) vQueueDelete(ddnsResultQueue);
+    ddnsJobQueue = ddnsResultQueue = nullptr;
+  }
+  configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
+}
+
+void pollDdns() {
+  syncPcIpv6Prefix();
+  DdnsResult result;
+  if (ddnsResultQueue && xQueueReceive(ddnsResultQueue, &result, 0) == pdTRUE) {
+    ddnsBusy = false;
+    DdnsRecordState &state = result.job.pc ? pcDdnsState : espDdnsState;
+    String currentIp = result.job.pc ? pcIpv6 : currentGlobalIpv6();
+    if (result.job.revision == ddnsRevision && sameIpv6(currentIp, String(result.job.ipv6))) {
+      if (result.code == 0 || result.code == 1) {
+        state.publishedIp = result.job.ipv6;
+        state.failures = 0;
+        state.status = result.code == 1 ? "DNS matches; no update needed" : "Updated";
+      } else {
+        state.failures = std::min(static_cast<int>(state.failures) + 1, 5);
+        state.status = result.code == -2 ? "DuckDNS rejected token or hostname" :
+                       result.code == -3 ? "DNS check failed; retry scheduled" :
+                       result.code == -1 ? "Network/TLS failure; retry scheduled" : "HTTP " + String(result.code);
+      }
+    }
+    memset(&result, 0, sizeof(result));
+  }
+  if (!ddnsEnabled || ddnsBusy || WiFi.status() != WL_CONNECTED) return;
+  if (!ddnsJobQueue) { espDdnsState.status = pcDdnsState.status = "DDNS worker unavailable"; return; }
+  if (time(nullptr) < 1700000000) { espDdnsState.status = pcDdnsState.status = "Waiting for network time (TLS)"; return; }
+  for (int index = 0; index < 2; ++index) {
+    bool pc = ddnsNextPc;
+    ddnsNextPc = !ddnsNextPc;
+    DdnsRecordState &state = pc ? pcDdnsState : espDdnsState;
+    String address = pc ? pcIpv6 : currentGlobalIpv6();
+    if (!isGlobalIpv6(address)) { state.status = "Waiting for global IPv6"; continue; }
+    if (pc && autoDetectPc && !pcIpv6Inferred && (!pcReportReceived || millis() - lastPcReportAt > 180000)) {
+      state.status = "Waiting for Windows helper";
+      continue;
+    }
+    unsigned long retry = state.failures ? std::min(30000UL << (state.failures - 1), 900000UL) : 300000UL;
+    if (state.attempted && millis() - state.lastAttempt < retry &&
+        (state.failures || sameIpv6(state.publishedIp, address))) continue;
+    DdnsJob job = {};
+    strlcpy(job.label, (pc ? pcHostname : espHostname).c_str(), sizeof(job.label));
+    strlcpy(job.token, ddnsToken.c_str(), sizeof(job.token));
+    strlcpy(job.ipv6, address.c_str(), sizeof(job.ipv6));
+    job.revision = ddnsRevision;
+    job.pc = pc;
+    if (xQueueSend(ddnsJobQueue, &job, 0) == pdTRUE) {
+      ddnsBusy = true;
+      state.lastAttempt = millis();
+      state.attempted = true;
+      state.status = "Checking DNS";
+    }
+    memset(&job, 0, sizeof(job));
+    break;
+  }
+}
 
 void handleWifiGotIPv6(arduino_event_id_t event, arduino_event_info_t info) {
   if (event != ARDUINO_EVENT_WIFI_STA_GOT_IP6 || !useIpv6Enabled) return;
@@ -94,9 +485,14 @@ void handleWifiGotIPv6(arduino_event_id_t event, arduino_event_info_t info) {
   addressText.toLowerCase();
   const bool isLinkLocal = addressText.startsWith("fe80:");
   ipv6LinkLocalAssigned |= isLinkLocal;
-  ipv6GlobalAssigned |= !isLinkLocal;
+  ipv6GlobalAssigned |= isGlobalIpv6(addressText);
+  if (isGlobalIpv6(addressText)) {
+    portENTER_CRITICAL(&ipv6AddressMux);
+    latestGlobalIpv6 = info.got_ip6.ip6_info.ip;
+    portEXIT_CRITICAL(&ipv6AddressMux);
+  }
   Serial.printf("[STA] IPv6 %s address assigned: %s\n",
-                isLinkLocal ? "link-local" : "global",
+                isLinkLocal ? "link-local" : isGlobalIpv6(addressText) ? "global" : "local",
                 addressText.c_str());
 }
 
@@ -210,6 +606,7 @@ void clearSavedConfig() {
   autoReconnectEnabled = DEFAULT_AUTO_RECONNECT_ENABLED;
   useIpv6Enabled = DEFAULT_USE_IPV6;
   sessionToken = "";
+  resetDiscoveryConfig();
 
   preferences.begin(CONFIG_NAMESPACE, false);
   preferences.clear();
@@ -256,6 +653,7 @@ void loadConfig() {
   adminPasswordHash = preferences.getString("admin_pwd_hash", DEFAULT_ADMIN_PASSWORD_HASH);
   autoReconnectEnabled = preferences.getBool("auto_reconnect", DEFAULT_AUTO_RECONNECT_ENABLED);
   useIpv6Enabled = preferences.getBool("use_ipv6", DEFAULT_USE_IPV6);
+  loadDiscoveryConfig();
   preferences.end();
 }
 
@@ -270,6 +668,15 @@ void saveConfig() {
   preferences.putString("admin_pwd_hash", adminPasswordHash);
   preferences.putBool("auto_reconnect", autoReconnectEnabled);
   preferences.putBool("use_ipv6", useIpv6Enabled);
+  preferences.putBool("pc_auto", autoDetectPc);
+  preferences.putString("pc_ipv4", pcIpv4);
+  preferences.putString("pc_ipv6", pcIpv6);
+  preferences.putString("esp_ipv6", lastEspIpv6);
+  preferences.putBool("pc_inferred", pcIpv6Inferred);
+  preferences.putBool("ddns_enabled", ddnsEnabled);
+  preferences.putString("ddns_token", ddnsToken);
+  preferences.putString("esp_host", espHostname);
+  preferences.putString("pc_host", pcHostname);
   preferences.putBool("fac_rs_pd", false);
   preferences.end();
   Serial.printf("[CFG] Saved: SSID=%s target=%s port=%u\n", wifiSsid.c_str(), targetIp.c_str(), configPort);
@@ -381,13 +788,10 @@ bool isPcOnline() {
     return false;
   }
 
-  IPAddress ip;
-  if (!ip.fromString(targetIp)) {
+  ip_addr_t target_addr;
+  if (!ipaddr_aton(targetIp.c_str(), &target_addr)) {
     return false;
   }
-
-  ip_addr_t target_addr;
-  IP_ADDR4(&target_addr, ip[0], ip[1], ip[2], ip[3]);
 
   const int attempts = 3;
   const uint32_t perPingTimeoutMs = 250;
@@ -396,6 +800,10 @@ bool isPcOnline() {
       return true;
     }
     if (i < attempts - 1) delay(30);
+  }
+  if (IP_IS_V6(&target_addr) && isPrivateIpv4(pcIpv4)) {
+    ipaddr_aton(pcIpv4.c_str(), &target_addr);
+    return pingOnce(target_addr, perPingTimeoutMs);
   }
   return false;
 }
@@ -441,6 +849,13 @@ String buildNetworkInfoJson() {
                        : "off";
 
   String json = "{\"mode\":\"" + String(modeName) + "\",";
+  json += "\"esp_hostname\":\"" + String(ddnsEnabled && espHostname.length() ? espHostname + ".duckdns.org" : "") + "\",";
+  json += "\"pc_hostname\":\"" + String(ddnsEnabled && pcHostname.length() ? pcHostname + ".duckdns.org" : "") + "\",";
+  json += "\"ddns_enabled\":" + String(ddnsEnabled ? "true" : "false") + ",";
+  json += "\"esp_ddns_status\":\"" + espDdnsState.status + "\",";
+  json += "\"pc_ddns_status\":\"" + pcDdnsState.status + "\",";
+  json += "\"pc_ipv4\":\"" + pcIpv4 + "\",\"pc_ipv6\":\"" + pcIpv6 + "\",";
+  json += "\"pc_detection\":\"" + String(!autoDetectPc ? "Manual" : pcReportReceived && millis() - lastPcReportAt <= 180000 ? "Helper connected" : "Waiting for Windows helper") + "\",";
   json += "\"wifi_connected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
   json += "\"http_port\":" + String(configPort) + ",";
   json += "\"https_port\":" + String(httpsPort) + ",";
@@ -454,7 +869,7 @@ String buildNetworkInfoJson() {
     for (int i = 0; i < addressCount; ++i) {
       String address = IPv6Address(addresses[i].addr).toString();
       address.toLowerCase();
-      const char *scope = address.startsWith("fe80:") ? "link-local" : "global";
+      const char *scope = address.startsWith("fe80:") ? "link-local" : isGlobalIpv6(address) ? "global" : "local";
       if (i > 0) json += ",";
       json += "{\"address\":\"" + address + "\",\"scope\":\"" + String(scope) + "\"}";
     }
@@ -475,13 +890,15 @@ String buildLegacyPcStatusJson() {
 String buildApSetupPage() {
   String ssidValue = wifiSsid.length() > 0 ? wifiSsid : "";
   String portValue = String(configPort > 0 ? configPort : DEFAULT_CONFIG_PORT);
-  String targetValue = targetIp.length() > 0 ? targetIp : DEFAULT_TARGET_IP;
+  String targetValue = escapeHtml(pcIpv4);
   String powerLedPinValue = String(powerLedPin);
   String usePowerLedChecked = usePowerLedPin ? "checked" : "";
   String powerLedWrapDisplay = usePowerLedPin ? "block" : "none";
   String autoReconnectChecked = autoReconnectEnabled ? "checked" : "";
   String useIpv6Checked = useIpv6Enabled ? "checked" : "";
   String removePasswordDisplay = adminPasswordHash.length() > 0 ? "flex" : "none";
+  String autoDetectChecked = autoDetectPc ? "checked" : "";
+  String ddnsChecked = ddnsEnabled ? "checked" : "";
 
   String html = R"HTML(
 <!DOCTYPE html>
@@ -520,6 +937,12 @@ String buildApSetupPage() {
     .network-link:hover { color: #0e2d20; }
     .check-row { display: flex; align-items: flex-start; gap: 10px; font-weight: 600; }
     .check-row input { width: 18px; min-height: 18px; margin: 2px 0 0; }
+    .copy-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+    .copy-row .network-value { flex: 1; min-width: 0; }
+    .copy-button { width: 38px; min-width: 38px; min-height: 38px; margin: 0; padding: 6px; background: #f3f5f2; color: #173d2d; border: 1px solid #d4dbd5; }
+    .copy-button:hover { background: #e1e9e0; }
+    input:disabled { opacity: .65; }
+    [hidden] { display: none !important; }
     @media (max-width: 520px) { body { padding: 22px 10px 40px; } .card { padding: 22px 18px; } .network-row { grid-template-columns: 1fr; gap: 2px; } }
   </style>
 </head>
@@ -548,8 +971,31 @@ String buildApSetupPage() {
         <label>Web server port</label>
         <input name="port" type="number" min="1" max="65535" value=")HTML" + portValue + R"HTML(">
 
-        <label>Target computer IP</label>
-        <input name="target_ip" type="text" value=")HTML" + targetValue + R"HTML(" placeholder=")HTML" + String(DEFAULT_TARGET_IP) + R"HTML(">
+        <label class="check-row">
+          <input type="checkbox" id="autoDetectPc" name="pc_auto" value="1" )HTML" + autoDetectChecked + R"HTML(>
+          Automatically detect the computer connected over USB
+        </label>
+        <div id="manualPcFields">
+          <label for="pcIpv4">Computer IPv4 (LAN)</label>
+          <input id="pcIpv4" name="target_ip" type="text" value=")HTML" + targetValue + R"HTML(" maxlength="15" placeholder="192.168.1.135">
+          <label for="pcIpv6">Computer IPv6 (global)</label>
+          <input id="pcIpv6" name="pc_ipv6" type="text" value=")HTML" + escapeHtml(pcIpv6) + R"HTML(" maxlength="45" placeholder="">
+        </div>
+
+        <label class="check-row">
+          <input type="checkbox" id="ddnsEnabled" name="ddns_enabled" value="1" )HTML" + ddnsChecked + R"HTML(>
+          Automatically update IPv6 hostnames (DuckDNS)
+        </label>
+        <div id="ddnsFields">
+          <p class="small" id="ddnsRegistrationNote">DuckDNS registration is manual: create two different hostnames in the same DuckDNS account before saving. Use that account's token.</p>
+          <label for="ddnsToken">DuckDNS account token</label>
+          <input id="ddnsToken" name="ddns_token" type="password" autocomplete="new-password" maxlength="36" data-saved=")HTML" + String(ddnsToken.length() ? "1" : "0") + R"HTML(" placeholder=")HTML" + String(ddnsToken.length() ? "Saved; leave blank to keep" : "Account token") + R"HTML(">
+          <label for="espHostname">Registered ESP32 hostname</label>
+          <input id="espHostname" name="esp_host" type="text" aria-describedby="ddnsRegistrationNote" maxlength="75" value=")HTML" + escapeHtml(espHostname) + R"HTML(" placeholder="mypc-wake.duckdns.org" autocomplete="off">
+          <label for="pcHostname">Registered computer hostname</label>
+          <input id="pcHostname" name="pc_host" type="text" aria-describedby="ddnsRegistrationNote" maxlength="75" value=")HTML" + escapeHtml(pcHostname) + R"HTML(" placeholder="mypc-stream.duckdns.org" autocomplete="off">
+          <a class="network-link" href="https://www.duckdns.org/domains" target="_blank" rel="noopener noreferrer">Register hostnames on DuckDNS</a>
+        </div>
 
         <label class="check-row">
           <input type="checkbox" id="usePowerLed" name="use_power_led_pin" value="1" )HTML" + usePowerLedChecked + R"HTML(>
@@ -634,13 +1080,68 @@ String buildApSetupPage() {
       return scheme + '://' + host + ':' + port + '/';
     }
 
+    function addHostnameRow(container, label, hostname, url) {
+      const row = document.createElement('div');
+      row.className = 'network-row';
+      const name = document.createElement('span');
+      name.className = 'network-label';
+      name.textContent = label;
+      const value = document.createElement('div');
+      value.className = 'copy-row';
+      const host = document.createElement(url ? 'a' : 'span');
+      host.className = 'network-value' + (url ? ' network-link' : '');
+      host.textContent = url || hostname;
+      if (url) host.href = url;
+      const copy = document.createElement('button');
+      copy.type = 'button';
+      copy.className = 'copy-button';
+      copy.innerHTML = '&#128203;';
+      copy.title = 'Copy ' + label;
+      copy.setAttribute('aria-label', 'Copy ' + label);
+      copy.addEventListener('click', async () => {
+        try {
+          const text = url || hostname;
+          if (navigator.clipboard && window.isSecureContext) {
+            await navigator.clipboard.writeText(text);
+          } else {
+            const field = document.createElement('textarea');
+            field.value = text;
+            field.style.position = 'fixed';
+            field.style.opacity = '0';
+            document.body.appendChild(field);
+            field.select();
+            const copied = document.execCommand('copy');
+            field.remove();
+            if (!copied) throw new Error('Clipboard unavailable');
+          }
+          copy.title = 'Copied';
+        } catch (error) { copy.title = 'Select the hostname to copy it'; }
+      });
+      value.append(host, copy);
+      row.append(name, value);
+      container.appendChild(row);
+    }
+
     async function loadNetworkInfo() {
       const rows = document.getElementById('networkRows');
       try {
         const response = await fetch(routeBase + 'api/network', { credentials: 'same-origin' });
         if (!response.ok) throw new Error('HTTP ' + response.status);
         const info = await response.json();
+        if (document.getElementById('autoDetectPc').checked) {
+          document.getElementById('pcIpv4').value = info.pc_ipv4 || '';
+          document.getElementById('pcIpv6').value = info.pc_ipv6 || '';
+        }
         rows.replaceChildren();
+        if (info.esp_hostname) addHostnameRow(rows, 'ESP32 hostname', info.esp_hostname, buildDeviceUrl('https', info.esp_hostname, info.https_port));
+        if (info.pc_hostname) addHostnameRow(rows, 'PC hostname', info.pc_hostname);
+        if (info.ddns_enabled) {
+          addNetworkRow(rows, 'ESP32 DDNS', info.esp_ddns_status);
+          addNetworkRow(rows, 'PC DDNS', info.pc_ddns_status);
+        }
+        addNetworkRow(rows, 'PC detection', info.pc_detection);
+        addNetworkRow(rows, 'PC IPv4', info.pc_ipv4);
+        addNetworkRow(rows, 'PC IPv6', info.pc_ipv6);
         addNetworkRow(rows, 'Mode', info.mode);
         addNetworkRow(rows, 'STA IPv4', info.sta_ipv4);
         (info.sta_ipv6 || []).forEach((entry) => {
@@ -735,6 +1236,22 @@ String buildApSetupPage() {
     });
 
     const configForm = document.getElementById('configForm');
+    const autoDetectPc = document.getElementById('autoDetectPc');
+    const ddnsEnabled = document.getElementById('ddnsEnabled');
+    const ddnsToken = document.getElementById('ddnsToken');
+    function updateDiscoveryFields() {
+      document.getElementById('pcIpv4').disabled = autoDetectPc.checked;
+      document.getElementById('pcIpv6').disabled = autoDetectPc.checked;
+      document.getElementById('ddnsFields').hidden = !ddnsEnabled.checked;
+      ['ddnsToken', 'espHostname', 'pcHostname'].forEach((id) => {
+        const input = document.getElementById(id);
+        input.disabled = !ddnsEnabled.checked;
+        input.required = ddnsEnabled.checked && (id !== 'ddnsToken' || ddnsToken.dataset.saved !== '1');
+      });
+    }
+    autoDetectPc.addEventListener('change', updateDiscoveryFields);
+    ddnsEnabled.addEventListener('change', updateDiscoveryFields);
+    updateDiscoveryFields();
     const removeAdminPassword = document.getElementById('removeAdminPassword');
     const adminPassword = document.getElementById('adminPassword');
     removeAdminPassword.addEventListener('change', function() {
@@ -761,10 +1278,17 @@ String buildApSetupPage() {
         });
         const responseText = await response.text();
         if (!response.ok) {
-          throw new Error(responseText || 'HTTP ' + response.status);
+          statusBox.textContent = responseText || 'HTTP ' + response.status;
+          return;
         }
 
         const result = JSON.parse(responseText);
+        if (ddnsEnabled.checked && ddnsToken.value) {
+          ddnsToken.dataset.saved = '1';
+          ddnsToken.placeholder = 'Saved; leave blank to keep';
+        }
+        ddnsToken.value = '';
+        updateDiscoveryFields();
         configForm.querySelector('input[name="password"]').value = '';
         adminPassword.value = '';
         if (removeAdminPassword.checked) {
@@ -983,6 +1507,7 @@ void handleSaveConfig(HTTPRequest * req, HTTPResponse * res) {
 
   std::string ssidCustomField, ssidSelectField, passwordField, targetIpFieldValue, portFieldValue;
   std::string usePowerLedField, powerLedPinField, adminPasswordField, removeAdminPasswordField, autoReconnectField, useIpv6Field;
+  std::string pcAutoField, pcIpv6Field, ddnsEnabledField, ddnsTokenField, espHostField, pcHostField;
 
   HTTPURLEncodedBodyParser parser(req);
   while (parser.nextField()) {
@@ -992,6 +1517,11 @@ void handleSaveConfig(HTTPRequest * req, HTTPResponse * res) {
     while (!parser.endOfField()) {
       size_t readLength = parser.read((byte *)buf, sizeof(buf) - 1);
       buf[readLength] = '\0';
+      if (value.length() + readLength > 1024) {
+        res->setStatusCode(400);
+        res->print("Configuration field too long");
+        return;
+      }
       value += buf;
     }
     if (name == "ssid_custom") ssidCustomField = value;
@@ -1005,6 +1535,12 @@ void handleSaveConfig(HTTPRequest * req, HTTPResponse * res) {
     else if (name == "remove_admin_password") removeAdminPasswordField = value;
     else if (name == "auto_reconnect") autoReconnectField = value;
     else if (name == "use_ipv6") useIpv6Field = value;
+    else if (name == "pc_auto") pcAutoField = value;
+    else if (name == "pc_ipv6") pcIpv6Field = value;
+    else if (name == "ddns_enabled") ddnsEnabledField = value;
+    else if (name == "ddns_token") ddnsTokenField = value;
+    else if (name == "esp_host") espHostField = value;
+    else if (name == "pc_host") pcHostField = value;
   }
 
   String ssidValue = ssidCustomField.length() > 0 ? String(ssidCustomField.c_str()) : String(ssidSelectField.c_str());
@@ -1017,6 +1553,30 @@ void handleSaveConfig(HTTPRequest * req, HTTPResponse * res) {
   bool removeAdminPassword = (removeAdminPasswordField == "1" || removeAdminPasswordField == "on" || removeAdminPasswordField == "true");
   bool autoReconnectValue = (autoReconnectField == "1" || autoReconnectField == "on" || autoReconnectField == "true");
   bool useIpv6Value = (useIpv6Field == "1" || useIpv6Field == "on" || useIpv6Field == "true");
+  bool pcAutoValue = pcAutoField == "1";
+  bool ddnsValue = ddnsEnabledField == "1";
+  String ipv6Value(pcIpv6Field.c_str());
+  targetValue.trim();
+  ipv6Value.trim();
+  String espLabel = espHostField.empty() && !ddnsValue ? espHostname : normalizeDuckLabel(String(espHostField.c_str()));
+  String pcLabel = pcHostField.empty() && !ddnsValue ? pcHostname : normalizeDuckLabel(String(pcHostField.c_str()));
+  String tokenValue = ddnsTokenField.empty() ? ddnsToken : String(ddnsTokenField.c_str());
+  tokenValue.trim();
+  String validationError;
+  if (!pcAutoValue && ((targetValue.length() && !isPrivateIpv4(targetValue)) ||
+      (ipv6Value.length() && !isGlobalIpv6(ipv6Value)) || (!targetValue.length() && !ipv6Value.length()))) {
+    validationError = "Enter a LAN IPv4 and/or a global IPv6 address for the computer";
+  } else if (ddnsValue && (!useIpv6Value || !wakepolicy::isDuckToken(tokenValue.c_str(), tokenValue.length()) ||
+      !wakepolicy::isDuckLabel(espLabel.c_str(), espLabel.length()) ||
+      !wakepolicy::isDuckLabel(pcLabel.c_str(), pcLabel.length()) || espLabel == pcLabel)) {
+    validationError = "DuckDNS requires IPv6 enabled, a valid account token, and two different registered DuckDNS hostnames";
+  }
+  if (validationError.length()) {
+    res->setStatusCode(400);
+    res->setHeader("Content-Type", "text/plain");
+    res->print(validationError);
+    return;
+  }
 
   if (ssidValue.length() == 0) {
     res->setStatusCode(400);
@@ -1032,7 +1592,13 @@ void handleSaveConfig(HTTPRequest * req, HTTPResponse * res) {
     return;
   }
 
-  if (portValue.toInt() == 79 || portValue.toInt() == 80) {
+  long requestedPort = portValue.toInt();
+  if (requestedPort < 1 || requestedPort > 65535) {
+    res->setStatusCode(400);
+    res->print("Web server port must be between 1 and 65535");
+    return;
+  }
+  if (requestedPort == 79 || requestedPort == 80) {
     res->setStatusCode(400);
     res->setHeader("Content-Type", "text/plain");
     res->print("port 79 and 80 are reserved for the Alexa bridge");
@@ -1040,11 +1606,20 @@ void handleSaveConfig(HTTPRequest * req, HTTPResponse * res) {
   }
 
   wifiSsid = ssidValue;
-  targetIp = targetValue.length() > 0 ? targetValue : targetIp;
-  configPort = portValue.toInt();
-  if (configPort < 1 || configPort > 65535) {
-    configPort = DEFAULT_CONFIG_PORT;
+  if (autoDetectPc != pcAutoValue) pcReportReceived = false;
+  autoDetectPc = pcAutoValue;
+  if (!autoDetectPc) { pcIpv4 = targetValue; pcIpv6 = ipv6Value; pcIpv6Inferred = false; }
+  if (wifiSsid != previousSsid) { lastEspIpv6 = ""; pcIpv6Inferred = false; }
+  if (ddnsEnabled != ddnsValue || ddnsToken != tokenValue || espHostname != espLabel || pcHostname != pcLabel) {
+    ++ddnsRevision;
+    espDdnsState = DdnsRecordState();
+    pcDdnsState = DdnsRecordState();
   }
+  ddnsEnabled = ddnsValue;
+  ddnsToken = tokenValue;
+  espHostname = espLabel;
+  pcHostname = pcLabel;
+  configPort = static_cast<uint16_t>(requestedPort);
   usePowerLedPin = useLedValue;
   powerLedPin = ledPinValue;
   if (removeAdminPassword || adminPasswordHash.length() == 0) {
@@ -1055,6 +1630,7 @@ void handleSaveConfig(HTTPRequest * req, HTTPResponse * res) {
   }
   autoReconnectEnabled = autoReconnectValue;
   useIpv6Enabled = useIpv6Value;
+  selectPcTarget();
   lastIpv6RetryAt = millis();
   if (usePowerLedPin) {
     pinMode(powerLedPin, INPUT_PULLUP);
@@ -1558,6 +2134,7 @@ void setup() {
     adminPasswordHash = DEFAULT_ADMIN_PASSWORD_HASH;
     autoReconnectEnabled = DEFAULT_AUTO_RECONNECT_ENABLED;
     useIpv6Enabled = DEFAULT_USE_IPV6;
+    resetDiscoveryConfig();
   } else if (!isFactoryResetRequested()) {
     if (preferences.isKey("wifi_ssid")) {
       wifiSsid = preferences.getString("wifi_ssid");
@@ -1571,8 +2148,11 @@ void setup() {
     adminPasswordHash = preferences.getString("admin_pwd_hash", DEFAULT_ADMIN_PASSWORD_HASH);
     autoReconnectEnabled = preferences.getBool("auto_reconnect", DEFAULT_AUTO_RECONNECT_ENABLED);
     useIpv6Enabled = preferences.getBool("use_ipv6", DEFAULT_USE_IPV6);
+    loadDiscoveryConfig();
   }
   preferences.end();
+
+  startDdnsWorker();
 
   if (usePowerLedPin) {
     pinMode(powerLedPin, INPUT_PULLUP);
@@ -1591,6 +2171,8 @@ void setup() {
 }
 
 void loop() {
+  pollSerialHelper();
+  pollDdns();
   monitorFactoryResetHold();
   if (httpServer) httpServer->loop();
   if (httpsServer) httpsServer->loop();
