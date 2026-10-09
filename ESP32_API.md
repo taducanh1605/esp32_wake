@@ -83,12 +83,19 @@ The client-side password state must match the ESP32 password state. A client tha
 | Factory reset | `/reset` | `/api/reset`, `/rs` | `GET`, `POST`, `OPTIONS` |
 | Configuration page | `/` | None | `GET` |
 | Configuration login | `/login` | None | `POST` |
+| Certificate confirmation tab | `/certificate-check` | None | `GET` |
 | Scan WiFi | `/api/scan` | None | `GET` |
 | Network addresses and hostname status | `/api/network` | None | `GET` |
 | Save configuration | `/api/config` | None | `POST` |
 | Reset from configuration page | `/api/config/reset` | None | `POST` |
 
 Use the authentication contract above for status, wake, shutdown, and reset endpoints.
+
+## Certificate confirmation
+
+Open `GET /certificate-check` in a new tab from a user-initiated dashboard action, using the same HTTPS hostname and port as device requests. After the user confirms the browser's certificate warning for their own device, this endpoint returns `200` HTML with `Cache-Control: no-store` and calls `window.close()`. It is unauthenticated, sends no login cookie, and does not change device configuration. Preserve any reverse-proxy path prefix.
+
+This does not bypass TLS verification or install a certificate. A script-opened tab can normally close itself; if a browser/PWA handoff or manual navigation prevents closing, the page displays "Connection confirmed" and can be closed manually. Trust exceptions may be scoped to a different browser context than the PWA. Do not automatically accept warnings for unknown devices.
 
 ## USB discovery and DuckDNS
 

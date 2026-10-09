@@ -928,6 +928,9 @@ String buildApSetupPage() {
     .status { margin-top: 16px; padding: 12px 13px; border-radius: 6px; background: #f3f5f2; color: #637069; font-size: .82rem; }
     .network-info { margin-bottom: 24px; padding-bottom: 22px; border-bottom: 1px solid #d4dbd5; }
     .network-info h2 { margin: 0 0 12px; color: #173d2d; font-size: 1.08rem; }
+    #networkDetails { margin-top: 12px; }
+    #networkDetails summary { min-height: 44px; padding: 10px 0; color: #173d2d; font-size: .86rem; font-weight: 700; cursor: pointer; }
+    #networkDetails summary:focus-visible { outline: 3px solid rgba(23,61,45,.24); outline-offset: 2px; }
     .network-row { display: grid; grid-template-columns: 130px minmax(0, 1fr); gap: 12px; padding: 8px 0; border-bottom: 1px solid #edf1ec; font-size: .86rem; }
     .network-row:last-child { border-bottom: 0; }
     .network-label { color: #637069; font-weight: 700; }
@@ -951,10 +954,15 @@ String buildApSetupPage() {
     <h1>ESP32 Wake Setup</h1>
     <div class="card">
       <section class="network-info" aria-labelledby="networkInfoTitle">
-        <h2 id="networkInfoTitle">Network addresses</h2>
+        <h2 id="networkInfoTitle">Network connection</h2>
+        <div id="networkDnsRows" aria-live="polite" hidden></div>
         <div id="networkRows" aria-live="polite">
           <div class="network-row"><span class="network-label">Status</span><span class="network-value">Loading...</span></div>
         </div>
+        <details id="networkDetails" open>
+          <summary>IP addresses and connection URLs</summary>
+          <div id="networkAddressRows" aria-live="polite"></div>
+        </details>
       </section>
       <form id="configForm" method="POST">
         <label>WiFi network</label>
@@ -1122,8 +1130,17 @@ String buildApSetupPage() {
       container.appendChild(row);
     }
 
+    function updateNetworkDetails() {
+      const dnsEnabled = document.getElementById('ddnsEnabled').checked;
+      document.getElementById('networkDnsRows').hidden = !dnsEnabled;
+      document.getElementById('networkDetails').open = !dnsEnabled;
+      document.getElementById('networkInfoTitle').textContent = dnsEnabled ? 'DNS status' : 'Network connection';
+    }
+
     async function loadNetworkInfo() {
       const rows = document.getElementById('networkRows');
+      const dnsRows = document.getElementById('networkDnsRows');
+      const addressRows = document.getElementById('networkAddressRows');
       try {
         const response = await fetch(routeBase + 'api/network', { credentials: 'same-origin' });
         if (!response.ok) throw new Error('HTTP ' + response.status);
@@ -1133,42 +1150,46 @@ String buildApSetupPage() {
           document.getElementById('pcIpv6').value = info.pc_ipv6 || '';
         }
         rows.replaceChildren();
-        if (info.esp_hostname) addHostnameRow(rows, 'ESP32 hostname', info.esp_hostname, buildDeviceUrl('https', info.esp_hostname, info.https_port));
-        if (info.pc_hostname) addHostnameRow(rows, 'PC hostname', info.pc_hostname);
+        dnsRows.replaceChildren();
+        addressRows.replaceChildren();
+        if (info.esp_hostname) addHostnameRow(dnsRows, 'ESP32 hostname', info.esp_hostname, buildDeviceUrl('https', info.esp_hostname, info.https_port));
+        if (info.pc_hostname) addHostnameRow(dnsRows, 'PC hostname', info.pc_hostname);
         if (info.ddns_enabled) {
-          addNetworkRow(rows, 'ESP32 DDNS', info.esp_ddns_status);
-          addNetworkRow(rows, 'PC DDNS', info.pc_ddns_status);
+          addNetworkRow(dnsRows, 'ESP32 DDNS', info.esp_ddns_status);
+          addNetworkRow(dnsRows, 'PC DDNS', info.pc_ddns_status);
         }
         addNetworkRow(rows, 'PC detection', info.pc_detection);
-        addNetworkRow(rows, 'PC IPv4', info.pc_ipv4);
-        addNetworkRow(rows, 'PC IPv6', info.pc_ipv6);
-        addNetworkRow(rows, 'Mode', info.mode);
-        addNetworkRow(rows, 'STA IPv4', info.sta_ipv4);
+        addNetworkRow(addressRows, 'PC IPv4', info.pc_ipv4);
+        addNetworkRow(addressRows, 'PC IPv6', info.pc_ipv6);
+        addNetworkRow(addressRows, 'Mode', info.mode);
+        addNetworkRow(addressRows, 'STA IPv4', info.sta_ipv4);
         (info.sta_ipv6 || []).forEach((entry) => {
-          addNetworkRow(rows, 'STA IPv6 (' + entry.scope + ')', entry.address);
+          addNetworkRow(addressRows, 'STA IPv6 (' + entry.scope + ')', entry.address);
         });
         if (!info.sta_ipv6 || info.sta_ipv6.length === 0) {
-          addNetworkRow(rows, 'STA IPv6', 'Not assigned');
+          addNetworkRow(addressRows, 'STA IPv6', 'Not assigned');
         }
-        if (info.ap_ipv4) addNetworkRow(rows, 'AP IPv4', info.ap_ipv4);
+        if (info.ap_ipv4) addNetworkRow(addressRows, 'AP IPv4', info.ap_ipv4);
 
         const linksTitle = document.createElement('h3');
         linksTitle.className = 'network-links-title';
         linksTitle.textContent = 'Connection URLs';
-        rows.appendChild(linksTitle);
+        addressRows.appendChild(linksTitle);
         if (info.sta_ipv4) {
-          addNetworkLink(rows, 'IPv4 HTTP', buildDeviceUrl('http', info.sta_ipv4, info.http_port));
-          addNetworkLink(rows, 'IPv4 HTTPS', buildDeviceUrl('https', info.sta_ipv4, info.https_port));
+          addNetworkLink(addressRows, 'IPv4 HTTP', buildDeviceUrl('http', info.sta_ipv4, info.http_port));
+          addNetworkLink(addressRows, 'IPv4 HTTPS', buildDeviceUrl('https', info.sta_ipv4, info.https_port));
         }
         (info.sta_ipv6 || []).forEach((entry) => {
-          addNetworkLink(rows, 'IPv6 HTTP', buildDeviceUrl('http', entry.address, info.http_port));
-          addNetworkLink(rows, 'IPv6 HTTPS', buildDeviceUrl('https', entry.address, info.https_port));
+          addNetworkLink(addressRows, 'IPv6 HTTP', buildDeviceUrl('http', entry.address, info.http_port));
+          addNetworkLink(addressRows, 'IPv6 HTTPS', buildDeviceUrl('https', entry.address, info.https_port));
         });
         if (info.ap_ipv4) {
-          addNetworkLink(rows, 'Setup AP', buildDeviceUrl('http', info.ap_ipv4, 80));
+          addNetworkLink(addressRows, 'Setup AP', buildDeviceUrl('http', info.ap_ipv4, 80));
         }
       } catch (err) {
         rows.replaceChildren();
+        dnsRows.replaceChildren();
+        addressRows.replaceChildren();
         addNetworkRow(rows, 'Status', 'Unable to read network addresses');
       }
     }
@@ -1251,7 +1272,9 @@ String buildApSetupPage() {
     }
     autoDetectPc.addEventListener('change', updateDiscoveryFields);
     ddnsEnabled.addEventListener('change', updateDiscoveryFields);
+    ddnsEnabled.addEventListener('change', updateNetworkDetails);
     updateDiscoveryFields();
+    updateNetworkDetails();
     const removeAdminPassword = document.getElementById('removeAdminPassword');
     const adminPassword = document.getElementById('adminPassword');
     removeAdminPassword.addEventListener('change', function() {
@@ -1896,8 +1919,35 @@ void handleCaptiveProbe(HTTPRequest * req, HTTPResponse * res) {
   res->print("<html><head><meta http-equiv=\"refresh\" content=\"0;url=/\"></head><body>Redirecting...</body></html>");
 }
 
+String buildCertificateCheckPage() {
+  return R"HTML(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ESP32 Wake - Connection confirmed</title>
+</head>
+<body>
+  <h1>Connection confirmed</h1>
+  <p>You may close this tab.</p>
+  <script>window.close();</script>
+</body>
+</html>
+)HTML";
+}
+
+void handleCertificateCheck(HTTPRequest * req, HTTPResponse * res) {
+  req->discardRequestBody();
+  res->setHeader("Cache-Control", "no-store");
+  res->setHeader("Referrer-Policy", "no-referrer");
+  res->setHeader("Content-Type", "text/html; charset=utf-8");
+  res->print(buildCertificateCheckPage());
+}
+
 void buildRoutes() {
   routeNodes.push_back(new ResourceNode("/", "GET", &handleRoot));
+  routeNodes.push_back(new ResourceNode("/certificate-check", "GET", &handleCertificateCheck));
   routeNodes.push_back(new ResourceNode("/login", "POST", &handleLogin));
   routeNodes.push_back(new ResourceNode("/api/config", "POST", &handleSaveConfig));
   routeNodes.push_back(new ResourceNode("/api/config/reset", "POST", &handleConfigReset));

@@ -126,6 +126,10 @@ http://192.168.1.28/shutdown
 
 Trang cấu hình (`GET /`) luôn có thể truy cập được qua port này, kể cả sau khi đã cấu hình xong. Nếu đã đặt "Mật khẩu điều khiển" lúc setup, trang này sẽ yêu cầu đăng nhập trước khi cho xem/sửa cấu hình (đăng nhập một lần, phiên làm việc lưu bằng cookie cho tới khi board khởi động lại).
 
+### HTTPS certificate confirmation
+
+The dashboard's certificate confirmation button opens `GET /certificate-check` using the saved HTTPS address and port. After you accept the browser warning for your own ESP32, this page attempts to close its tab automatically. No password or configuration session is required or changed. If the browser or mobile PWA handoff prevents closing, it displays "Connection confirmed" and you can close the tab manually. This does not install a trusted certificate or bypass TLS verification; an exception in another browser context may not apply to the PWA.
+
 ### IPv6
 
 Ở chế độ STA, firmware tự bật IPv6 và HTTP/HTTPS server ưu tiên listener dual-stack trên cùng các port đã cấu hình. Nếu lwIP không tạo được socket dual-stack, server tự quay về IPv4 để không làm mất đường cấu hình.
@@ -165,11 +169,13 @@ Hai tính năng này mặc định **tắt** để giữ nguyên cấu hình cũ
 5. Tích **Automatically update IPv6 hostnames (DuckDNS)**, nhập account token và hai hostname đã đăng ký. Có thể nhập subdomain hoặc tên đầy đủ có đuôi `.duckdns.org`.
 6. Save configuration. Ô token luôn để trống sau khi tải trang; để trống khi sửa cấu hình sẽ giữ token đã lưu.
 
-Phần đầu thông tin mạng hiển thị hostname và nút sao chép trước các địa chỉ IP:
+Khi bật cập nhật DuckDNS, phần đầu thông tin mạng ưu tiên hostname và trạng thái DNS:
 
 - ESP32: URL HTTPS, ví dụ `https://mypc-wake.duckdns.org:2444/`. Cổng luôn lấy từ cổng HTTPS thực tế; nếu HTTP là `65535`, HTTPS là `65534`.
 - PC: `mypc-stream.duckdns.org`, dùng làm hostname khi thêm PC trong Moonlight/Artemis.
 - Trạng thái cập nhật của từng hostname và trạng thái helper được hiển thị riêng.
+
+IPv4/IPv6 và các URL kết nối nằm trong mục **IP addresses and connection URLs**, tự thu gọn khi bật DuckDNS nhưng vẫn có thể mở để kiểm tra. Khi tắt DuckDNS, hostname/trạng thái DNS và các ô cấu hình DuckDNS được ẩn, mục địa chỉ IP tự mở lại. Bật/tắt checkbox cập nhật phần hiển thị ngay; thay đổi cấu hình trên mạch vẫn cần Save configuration. Refresh không đóng lại mục IP nếu bạn đã mở thủ công.
 
 ESP32 ưu tiên IPv6 global cho ping PC, có fallback IPv4 LAN. Helper gửi cả hai IP; không chọn VPN/adapter ảo mặc định, loại link-local/ULA và ưu tiên IPv6 ổn định hơn temporary address trên adapter phù hợp. Nếu chỉ có temporary global IPv6, helper vẫn dùng nó và theo dõi thay đổi.
 
